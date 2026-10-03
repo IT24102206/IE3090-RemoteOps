@@ -1,0 +1,14 @@
+.RECIPEPREFIX = >
+CC = gcc
+CFLAGS = -Wall -Wextra -g -pthread
+
+all: agent_206 controller_206
+
+agent_206: agent_206.c
+> $(CC) $(CFLAGS) -o agent_206 agent_206.c
+
+controller_206: controller_206.c
+> $(CC) $(CFLAGS) -o controller_206 controller_206.c
+
+clean:
+> rm -f agent_206 controller_206
