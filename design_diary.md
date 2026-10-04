@@ -15,3 +15,7 @@
 - PUT writes to a hidden .part file and renames it on success, so a dropped connection never leaves a half file.
 - Filenames are restricted to letters, digits, . _ - (no ../ traversal). 10 MB upload limit.
 - Optional extension: Controller reports transfer throughput (bytes/sec) for PUT and GET.
+
+## 2026-10-04
+- MONITOR: each monitored session gets its own thread sending a UDP datagram every 2 seconds to the Controller's IP (taken from the TCP connection) on the requested port. The Controller opens its UDP port BEFORE sending MONITOR START.
+- The thread sleeps in 0.1 s slices and checks a stop flag, so STOP/QUIT/disconnect end it quickly; pthread_join makes sure it is gone before the session memory is freed.

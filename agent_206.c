@@ -35,6 +35,10 @@ typedef struct {
     int  authed;          /* 0 until AUTH succeeds */
     char buf[BUF_SIZE];   /* bytes received but not yet consumed */
     int  len;
+    int  mon_active;          /* 1 while a monitor thread exists */
+    volatile int mon_stop;    /* set to 1 to ask the monitor thread to finish */
+    int  mon_port;            /* Controller UDP port */
+    pthread_t mon_tid;
 } conn_t;
 
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -319,6 +323,64 @@ static int handle_get(conn_t *c, const char *args) {
     return 0;
 }
 
+/* ---------- MONITOR: UDP stats stream, one thread per monitored session ---------- */
+#define MON_INTERVAL_SEC 2          /* a datagram is sent every 2 seconds */
+
+static void *monitor_thread(void *arg) {
+    conn_t *c = (conn_t *)arg;
+    int ufd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ufd < 0) return NULL;
+
+    struct sockaddr_in dst;                       /* Controller's IP + its UDP port */
+    memset(&dst, 0, sizeof dst);
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons((unsigned short)c->mon_port);
+    inet_pton(AF_INET, c->ip, &dst.sin_addr);
+
+    while (!c->mon_stop) {
+        char stats[128], msg[200];
+        sysinfo_string(stats, sizeof stats);
+        int n = snprintf(msg, sizeof msg, "SYSINFO %s SID:%s", stats, SID);
+        sendto(ufd, msg, (size_t)n, 0, (struct sockaddr *)&dst, sizeof dst);
+        for (int i = 0; i < MON_INTERVAL_SEC * 10 && !c->mon_stop; i++)
+            usleep(100000);                       /* sleep in 0.1 s slices so STOP reacts fast */
+    }
+    close(ufd);
+    return NULL;
+}
+
+static void monitor_stop(conn_t *c) {
+    if (!c->mon_active) return;
+    c->mon_stop = 1;
+    pthread_join(c->mon_tid, NULL);
+    c->mon_active = 0;
+}
+
+static int handle_monitor(conn_t *c, const char *args) {
+    char sub[16] = "";
+    int port = 0;
+    int n = sscanf(args, "%15s %d", sub, &port);
+
+    if (n >= 1 && strcmp(sub, "START") == 0) {
+        if (n != 2 || port < 1 || port > 65535) return reply(c, "ERR 009 BAD_ARGUMENTS");
+        if (c->mon_active) return reply(c, "ERR 012 ALREADY_MONITORING");
+        c->mon_port = port;
+        c->mon_stop = 0;
+        if (pthread_create(&c->mon_tid, NULL, monitor_thread, c) != 0)
+            return reply(c, "ERR 014 MONITOR_FAILED");
+        c->mon_active = 1;
+        log_msg("MONITOR START %s:%d -> udp port %d", c->ip, c->port, port);
+        return reply(c, "OK MONITOR_STARTED");
+    }
+    if (n >= 1 && strcmp(sub, "STOP") == 0) {
+        if (!c->mon_active) return reply(c, "ERR 013 NOT_MONITORING");
+        monitor_stop(c);
+        log_msg("MONITOR STOP %s:%d", c->ip, c->port);
+        return reply(c, "OK MONITOR_STOPPED");
+    }
+    return reply(c, "ERR 009 BAD_ARGUMENTS");
+}
+
 /* Thread: serves one Controller from connect to disconnect */
 static void *client_thread(void *arg) {
     conn_t *c = (conn_t *)arg;
@@ -357,6 +419,7 @@ static void *client_thread(void *arg) {
                 if (reply(c, "ERR 001 AUTH_FAILED") < 0) break;
             }
         } else if (strcmp(cmd, "QUIT") == 0) {
+            monitor_stop(c);
             reply(c, "OK BYE");
             break;
         } else if (strcmp(cmd, "SYSINFO") == 0) {
@@ -369,6 +432,8 @@ static void *client_thread(void *arg) {
             if (handle_put(c, rest) < 0) break;
         } else if (strcmp(cmd, "GET") == 0) {
             if (handle_get(c, rest) < 0) break;
+        } else if (strcmp(cmd, "MONITOR") == 0) {
+            if (handle_monitor(c, rest) < 0) break;
         } else {
             /* SYSINFO, LISTPROC, EXEC, PUT, GET, MONITOR come in Part B */
             if (reply(c, "ERR 006 UNKNOWN_COMMAND") < 0) break;
@@ -378,6 +443,7 @@ static void *client_thread(void *arg) {
     if (rc == 0) log_msg("DISCONNECT %s:%d (client closed)", c->ip, c->port);
     else         log_msg("DISCONNECT %s:%d (quit/error)", c->ip, c->port);
 
+    monitor_stop(c);
     close(c->fd);
     free(c);
     return NULL;
