@@ -1,3 +1,5 @@
 agent_206
 controller_206
 *.o
+downloads/
+*.bin

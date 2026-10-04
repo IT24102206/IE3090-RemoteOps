@@ -199,6 +199,126 @@ static int handle_exec(conn_t *c, const char *name) {
     return reply(c, "OK EXEC_RESULT %s", out);
 }
 
+/* ---------- File transfer helpers ---------- */
+#define MAX_FILE_SIZE (10LL * 1024 * 1024)      /* 10 MB limit for PUT */
+
+/* Only plain names: letters, digits, . _ -  (blocks ../ path tricks) */
+static int valid_filename(const char *s) {
+    size_t n = strlen(s);
+    if (n == 0 || n > 100 || s[0] == '.') return 0;
+    for (; *s; s++)
+        if (!isalnum((unsigned char)*s) && *s != '.' && *s != '_' && *s != '-') return 0;
+    return 1;
+}
+
+/* Read exactly n bytes: first the leftovers already in c->buf, then recv().
+ * Writes to 'out' (or throws the bytes away if out is NULL).
+ * Returns 0 ok, -1 connection lost, -2 disk write error. */
+static int recv_bytes(conn_t *c, FILE *out, long long n) {
+    char tmp[BUF_SIZE];
+    while (n > 0) {
+        if (c->len > 0) {                         /* bytes that arrived with the command */
+            int take = (n < c->len) ? (int)n : c->len;
+            if (out && fwrite(c->buf, 1, (size_t)take, out) != (size_t)take) return -2;
+            memmove(c->buf, c->buf + take, (size_t)(c->len - take));
+            c->len -= take;
+            n -= take;
+            continue;
+        }
+        size_t want = (n < (long long)sizeof tmp) ? (size_t)n : sizeof tmp;
+        ssize_t r = recv(c->fd, tmp, want, 0);
+        if (r == 0) return -1;
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (out && fwrite(tmp, 1, (size_t)r, out) != (size_t)r) return -2;
+        n -= r;
+    }
+    return 0;
+}
+
+/* ---------- PUT <filename> <filesize> + raw bytes ---------- */
+static int handle_put(conn_t *c, const char *args) {
+    char fname[256];
+    long long size = -1;
+    if (sscanf(args, "%255s %lld", fname, &size) != 2 || size < 0)
+        return reply(c, "ERR 009 BAD_ARGUMENTS");
+
+    int too_big  = size > MAX_FILE_SIZE;
+    int bad_name = !valid_filename(fname);
+    if (too_big || bad_name) {
+        log_msg("PUT REJECTED %s %lld from %s:%d (%s)", fname, size, c->ip, c->port,
+                too_big ? "too large" : "bad filename");
+        int rr;
+        if (too_big) rr = reply(c, "ERR 004 FILE_TOO_LARGE");
+        else         rr = reply(c, "ERR 010 BAD_FILENAME");
+        if (rr < 0 || size > (1LL << 30)) return -1;
+        return recv_bytes(c, NULL, size) == 0 ? 0 : -1;   /* discard the bytes that follow */
+    }
+
+    char path[512], tmp[512];
+    snprintf(path, sizeof path, "%s/%s", STORAGE_DIR, fname);
+    snprintf(tmp, sizeof tmp, "%s/.%s.%d.part", STORAGE_DIR, fname, c->fd);
+
+    FILE *f = fopen(tmp, "wb");                  /* write to a temp name first */
+    if (!f) {
+        log_msg("PUT FAILED %s: cannot create file", fname);
+        if (reply(c, "ERR 011 STORAGE_ERROR") < 0) return -1;
+        return recv_bytes(c, NULL, size) == 0 ? 0 : -1;
+    }
+
+    int rc = recv_bytes(c, f, size);
+    if (fclose(f) != 0 && rc == 0) rc = -2;
+    if (rc != 0) {                               /* half-uploaded file is deleted */
+        remove(tmp);
+        log_msg("PUT FAILED %s from %s:%d (%s)", fname, c->ip, c->port,
+                rc == -1 ? "connection lost" : "disk error");
+        if (rc == -2) reply(c, "ERR 011 STORAGE_ERROR");
+        return -1;
+    }
+    if (rename(tmp, path) != 0) {
+        remove(tmp);
+        return reply(c, "ERR 011 STORAGE_ERROR");
+    }
+    log_msg("PUT OK %s %lld bytes from %s:%d", fname, size, c->ip, c->port);
+    return reply(c, "OK FILE_RECEIVED %s", fname);
+}
+
+/* ---------- GET <filename> -> OK FILE_SEND name size + raw bytes ---------- */
+static int handle_get(conn_t *c, const char *args) {
+    char fname[256], path[512];
+    if (sscanf(args, "%255s", fname) != 1 || !valid_filename(fname))
+        return reply(c, "ERR 005 FILE_NOT_FOUND");
+
+    snprintf(path, sizeof path, "%s/%s", STORAGE_DIR, fname);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        log_msg("GET FAILED %s from %s:%d (not found)", fname, c->ip, c->port);
+        return reply(c, "ERR 005 FILE_NOT_FOUND");
+    }
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode)) {
+        fclose(f);
+        return reply(c, "ERR 005 FILE_NOT_FOUND");
+    }
+
+    long long size = st.st_size, left = size;
+    if (reply(c, "OK FILE_SEND %s %lld", fname, size) < 0) { fclose(f); return -1; }
+
+    char tmp[BUF_SIZE];
+    while (left > 0) {
+        size_t want = (left < (long long)sizeof tmp) ? (size_t)left : sizeof tmp;
+        size_t got = fread(tmp, 1, want, f);
+        if (got == 0 || send_all(c->fd, tmp, got) < 0) {
+            fclose(f);
+            log_msg("GET FAILED %s to %s:%d (transfer interrupted)", fname, c->ip, c->port);
+            return -1;
+        }
+        left -= (long long)got;
+    }
+    fclose(f);
+    log_msg("GET OK %s %lld bytes to %s:%d", fname, size, c->ip, c->port);
+    return 0;
+}
+
 /* Thread: serves one Controller from connect to disconnect */
 static void *client_thread(void *arg) {
     conn_t *c = (conn_t *)arg;
@@ -245,6 +365,10 @@ static void *client_thread(void *arg) {
             if (handle_listproc(c) < 0) break;
         } else if (strcmp(cmd, "EXEC") == 0) {
             if (handle_exec(c, rest) < 0) break;
+        } else if (strcmp(cmd, "PUT") == 0) {
+            if (handle_put(c, rest) < 0) break;
+        } else if (strcmp(cmd, "GET") == 0) {
+            if (handle_get(c, rest) < 0) break;
         } else {
             /* SYSINFO, LISTPROC, EXEC, PUT, GET, MONITOR come in Part B */
             if (reply(c, "ERR 006 UNKNOWN_COMMAND") < 0) break;
