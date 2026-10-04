@@ -15,6 +15,8 @@
 #include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <dirent.h>
+#include <ctype.h>
 
 #define REG_NO       "IT24102206"
 #define PORT         9410
@@ -109,6 +111,94 @@ static int read_line(conn_t *c, char *out, size_t outsz) {
     }
 }
 
+/* ---------- SYSINFO: read real values from /proc ---------- */
+static void sysinfo_string(char *out, size_t n) {
+    double load = 0.0, up = 0.0;
+    long total_kb = 0, avail_kb = 0, v;
+    char line[256];
+
+    FILE *f = fopen("/proc/loadavg", "r");
+    if (f) { if (fscanf(f, "%lf", &load) != 1) load = 0.0; fclose(f); }
+
+    f = fopen("/proc/meminfo", "r");
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "MemTotal: %ld kB", &v) == 1) total_kb = v;
+            else if (sscanf(line, "MemAvailable: %ld kB", &v) == 1) avail_kb = v;
+        }
+        fclose(f);
+    }
+
+    f = fopen("/proc/uptime", "r");
+    if (f) { if (fscanf(f, "%lf", &up) != 1) up = 0.0; fclose(f); }
+
+    /* cpu_load  mem_used_mb  uptime_sec */
+    snprintf(out, n, "%.2f %ld %ld", load, (total_kb - avail_kb) / 1024, (long)up);
+}
+
+static int handle_sysinfo(conn_t *c) {
+    char stats[128];
+    sysinfo_string(stats, sizeof stats);
+    return reply(c, "OK SYSINFO %s", stats);
+}
+
+/* ---------- LISTPROC: snapshot of /proc/<pid>/comm as pid/name,... ---------- */
+static int handle_listproc(conn_t *c) {
+    char out[1900];
+    size_t used = 0;
+    out[0] = '\0';
+
+    DIR *d = opendir("/proc");
+    if (!d) return reply(c, "ERR 007 PROC_UNAVAILABLE");
+
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (!isdigit((unsigned char)e->d_name[0])) continue;   /* only PID folders */
+        char path[300], name[64] = "?", item[400];
+        snprintf(path, sizeof path, "/proc/%s/comm", e->d_name);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            if (fgets(name, sizeof name, f)) name[strcspn(name, "\n")] = '\0';
+            fclose(f);
+        }
+        for (char *p = name; *p; p++) if (*p == ' ' || *p == ',') *p = '_';
+        int n = snprintf(item, sizeof item, "%s%s/%s", used ? "," : "", e->d_name, name);
+        if (used + (size_t)n >= sizeof out) break;             /* reply line is full */
+        memcpy(out + used, item, (size_t)n + 1);
+        used += (size_t)n;
+    }
+    closedir(d);
+    return reply(c, "OK PROCS %s", out);
+}
+
+/* ---------- EXEC: fixed whitelist. User text NEVER reaches the shell ---------- */
+static int handle_exec(conn_t *c, const char *name) {
+    const char *shellcmd = NULL;
+    if      (strcmp(name, "DATE")     == 0) shellcmd = "date";
+    else if (strcmp(name, "UPTIME")   == 0) shellcmd = "uptime";
+    else if (strcmp(name, "DISKFREE") == 0) shellcmd = "df -h /";
+    else if (strcmp(name, "HOSTNAME") == 0) shellcmd = "hostname";
+    else if (strcmp(name, "WHOAMI")   == 0) shellcmd = "whoami";
+
+    if (!shellcmd) {
+        log_msg("EXEC REJECTED '%s' from %s:%d", name, c->ip, c->port);
+        return reply(c, "ERR 002 COMMAND_NOT_ALLOWED");
+    }
+
+    char out[1500], line[256];
+    size_t used = 0;
+    out[0] = '\0';
+    FILE *p = popen(shellcmd, "r");
+    if (!p) return reply(c, "ERR 008 EXEC_FAILED");
+    while (fgets(line, sizeof line, p) && used < sizeof out - 300) {
+        line[strcspn(line, "\n")] = '\0';
+        used += (size_t)snprintf(out + used, sizeof out - used, "%s%s", used ? " " : "", line);
+    }
+    pclose(p);
+    if (used == 0) return reply(c, "ERR 008 EXEC_FAILED");
+    return reply(c, "OK EXEC_RESULT %s", out);
+}
+
 /* Thread: serves one Controller from connect to disconnect */
 static void *client_thread(void *arg) {
     conn_t *c = (conn_t *)arg;
@@ -149,6 +239,12 @@ static void *client_thread(void *arg) {
         } else if (strcmp(cmd, "QUIT") == 0) {
             reply(c, "OK BYE");
             break;
+        } else if (strcmp(cmd, "SYSINFO") == 0) {
+            if (handle_sysinfo(c) < 0) break;
+        } else if (strcmp(cmd, "LISTPROC") == 0) {
+            if (handle_listproc(c) < 0) break;
+        } else if (strcmp(cmd, "EXEC") == 0) {
+            if (handle_exec(c, rest) < 0) break;
         } else {
             /* SYSINFO, LISTPROC, EXEC, PUT, GET, MONITOR come in Part B */
             if (reply(c, "ERR 006 UNKNOWN_COMMAND") < 0) break;
