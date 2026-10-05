@@ -23,3 +23,6 @@
 ## 2026-10-05
 - Ran the full test plan (test_results.md): auth, all commands, byte-exact PUT/GET, UDP stream, partial lines, 5 clients, dropped connection during PUT.
 - Cleared the old log and storage before the final demo so the log excerpt and screenshots show a clean run.
+
+## 2026-10-05
+- Final review: re-ran build and tests, prepared submission ZIP, report and reflection.
