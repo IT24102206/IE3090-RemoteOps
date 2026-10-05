@@ -19,3 +19,7 @@
 ## 2026-10-04
 - MONITOR: each monitored session gets its own thread sending a UDP datagram every 2 seconds to the Controller's IP (taken from the TCP connection) on the requested port. The Controller opens its UDP port BEFORE sending MONITOR START.
 - The thread sleeps in 0.1 s slices and checks a stop flag, so STOP/QUIT/disconnect end it quickly; pthread_join makes sure it is gone before the session memory is freed.
+
+## 2026-10-05
+- Ran the full test plan (test_results.md): auth, all commands, byte-exact PUT/GET, UDP stream, partial lines, 5 clients, dropped connection during PUT.
+- Cleared the old log and storage before the final demo so the log excerpt and screenshots show a clean run.
